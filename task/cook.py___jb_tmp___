@@ -1,0 +1,497 @@
+from .seq2vec import *
+
+
+class Cook:
+    def __init__(self, config: settings.Config):
+        self.config = config
+        logging.info('[+] loading training data')
+        self.training_data = dict(np.load(self.config.train_npz_input))
+        logging.info('[-] loaded training data')
+        logging.info('[+] loading testing data')
+        self.test_data = dict(np.load(self.config.test_npz_input))
+        logging.info('[-] loaded testing data')
+
+    def train(self):
+        features = ['idx', 'idx_mask', 'ch_title', 'ch_vert', 'ch_subvert', 'cd_title', 'cd_vert', 'cd_subvert']
+        labels = ['cd_label']
+        return [self.training_data[x] for x in features], [self.training_data[x] for x in labels]
+
+    def valid(self):
+        features = ['idx', 'idx_mask', 'ch_title', 'ch_vert', 'ch_subvert', 'cd_title', 'cd_vert', 'cd_subvert']
+        labels = ['label']
+        return [self.test_data[x][:self.config.validation_step] for x in features], [
+            self.test_data[x][:self.config.validation_step] for x in labels]
+
+    def test(self):
+        features = ['idx', 'idx_mask', 'ch_title', 'ch_vert', 'ch_subvert', 'cd_title', 'cd_vert', 'cd_subvert']
+        labels = ['user', 'impr', 'idx_mask', 'label']
+        return [self.test_data[x] for x in features], [self.test_data[x] for x in labels]
+
+    def build_model(self, epoch):
+        if epoch == 0:
+            self._build_model()
+        return self.train_model
+
+    def get_doc_encoder(self):
+        title = keras.Input(self.training_data['ch_title'].shape[2:])
+        # vert = keras.Input(self.training_data['ch_vert'].shape[2:])
+        # subvert = keras.Input(self.training_data['ch_subvert'].shape[2:])
+        vert = keras.Input((1,))
+        subvert = keras.Input((1,))
+
+        title_embedding = np.load(self.config.title_embedding_input + '.npy')
+        title_embedding_layer = keras.layers.Embedding(
+            *title_embedding.shape,
+            input_length=self.training_data['ch_title'].shape[-1],
+            weights=[title_embedding],
+            trainable=self.config.textual_embedding_trainable)
+        title_e = title_embedding_layer(title)
+        title_d = keras.layers.Dropout(self.config.dropout)(title_e)
+        title_c = keras.layers.Conv1D(*self.config.title_filter_shape, padding='same', activation='relu', strides=1)(
+            title_d)
+        title_m = keras.layers.Lambda(
+            lambda x: x[0] * keras.backend.expand_dims(
+                keras.backend.switch(
+                    keras.backend.equal(x[1], 0),
+                    keras.backend.zeros_like(x[1], dtype=keras.backend.floatx()),
+                    keras.backend.ones_like(x[1], dtype=keras.backend.floatx()))))([title_c, title])
+
+        title_m = keras.layers.Masking()(title_m)
+        title_a = models.SimpleAttentionMaskSupport()(keras.layers.Dropout(self.config.dropout)(title_m))
+
+        vert_embedding_layer = keras.layers.Embedding(len(utils.verticals), self.config.vertical_embedding_dim)
+        subvert_embedding_layer = keras.layers.Embedding(len(utils.subverticals), self.config.subvertical_embedding_dim)
+
+        vert_m = keras.layers.Reshape((self.config.vertical_embedding_dim,))(vert_embedding_layer(vert))
+        subvert_m = keras.layers.Reshape((self.config.subvertical_embedding_dim,))(subvert_embedding_layer(subvert))
+
+        if self.config.use_vertical:
+            dense = keras.layers.concatenate([title_a, vert_m, subvert_m])
+        else:
+            dense = title_a
+
+        return (keras.layers.TimeDistributed(keras.Model(title, title_a)),
+                keras.layers.TimeDistributed(keras.Model(vert, vert_m)),
+                keras.layers.TimeDistributed(keras.Model(subvert, subvert_m)),
+                keras.Model([title, vert, subvert], dense),
+                keras.Model(title, title_a))
+
+    def get_user_encoder(self):
+        if self.config.use_vertical:
+            input_dim = self.config.title_filter_shape[
+                            0] + self.config.vertical_embedding_dim + self.config.subvertical_embedding_dim
+        else:
+            input_dim = self.config.title_filter_shape[0]
+
+        idx = keras.Input((1,))
+        idx_mask = keras.Input((1,))
+        ch = keras.Input((self.training_data['ch_title'].shape[-2], input_dim))
+
+        idx_embedding = keras.layers.Embedding(25000, self.config.user_embedding_dim)
+        idx_vec = keras.layers.Reshape((self.config.user_embedding_dim,))(idx_embedding(idx))
+        idx_vec = keras.layers.Lambda(lambda x: x[0] * x[1])(
+            [idx_vec, keras.layers.Dropout(1 - self.config.id_keep)(idx_mask)])
+
+        ch_m = keras.layers.Masking()(ch)
+
+        if self.config.arch == 'vo':
+            user_vec = idx_vec
+        elif self.config.arch == 'avg':
+            user_vec = models.GlobalAveragePoolingMaskSupport()(ch_m)
+        elif self.config.arch == 'gru':
+            user_vec = keras.layers.GRU(self.config.user_embedding_dim)(ch_m)
+        elif self.config.arch == 'igru':
+            clicked_vec = keras.layers.GRU(self.config.user_embedding_dim)(ch_m)
+            user_vec = keras.layers.concatenate([clicked_vec, idx_vec])
+        elif self.config.arch == 'agru':
+            clicked_vec = keras.layers.GRU(self.config.user_embedding_dim)(ch_m)
+            user_vec = keras.layers.add([clicked_vec, idx_vec])
+        elif self.config.arch == 'ingru':
+            user_vec = keras.layers.GRU(self.config.user_embedding_dim)(ch_m, initial_state=idx_vec)
+        elif self.config.arch == 'inigru':
+            idx_embedding2 = keras.layers.Embedding(25000, self.config.user_embedding_dim)
+            idx_vec2 = keras.layers.Reshape((self.config.user_embedding_dim,))(idx_embedding2(idx))
+            idx_vec2 = keras.layers.Lambda(lambda x: x[0] * x[1])(
+                [idx_vec2, keras.layers.Dropout(1 - self.config.id_keep)(idx_mask)])
+            clicked_vec = keras.layers.GRU(self.config.user_embedding_dim)(ch_m, initial_state=idx_vec)
+            user_vec = keras.layers.concatenate([clicked_vec, idx_vec2])
+        elif self.config.arch == 'inagru':
+            idx_embedding2 = keras.layers.Embedding(25000, self.config.user_embedding_dim)
+            idx_vec2 = keras.layers.Reshape((self.config.user_embedding_dim,))(idx_embedding2(idx))
+            idx_vec2 = keras.layers.Lambda(lambda x: x[0] * x[1])(
+                [idx_vec2, keras.layers.Dropout(1 - self.config.id_keep)(idx_mask)])
+            clicked_vec = keras.layers.GRU(self.config.user_embedding_dim)(ch_m, initial_state=idx_vec)
+            user_vec = keras.layers.add([clicked_vec, idx_vec2])
+        elif self.config.arch == 'atgru':
+            clicked_vec = keras.layers.GRU(self.config.user_embedding_dim)(ch_m)
+            user_vec = keras.layers.Lambda(lambda x: keras.backend.concatenate(
+                [keras.backend.expand_dims(x[0], -1), keras.backend.expand_dims(x[1], -1)], axis=-2))(
+                [clicked_vec, idx_vec])
+            user_vec = keras.layers.Masking()(user_vec)
+            user_vec = models.SimpleAttentionMaskSupport()(user_vec)
+        elif self.config.arch == 'algru':
+            clicked_vec = keras.layers.GRU(self.config.user_embedding_dim)(ch_m)
+            user_vec = models.AlphaAdd()([clicked_vec, idx_vec])
+        else:
+            raise NotImplementedError()
+        return keras.Model([idx, idx_mask, ch], user_vec)
+
+    def get_score_model(self, u, d):
+        u_input = keras.Input((u.shape[-1].value,))
+        d_input = keras.Input((d.shape[-1].value,))
+        if self.config.score_model == 'dot':
+            score = keras.layers.dot([u_input, d_input], -1)
+        elif self.config.score_model == 'dnn':
+            hid = keras.layers.concatenate([u_input, d_input])
+            hid = keras.layers.Dense(self.config.user_embedding_dim, activation='relu')(hid)
+            score = keras.layers.Dense(1)(hid)
+        elif self.config.score_model == 'ddot':
+            u_hid = keras.layers.Dense(self.config.user_embedding_dim)(u_input)
+            d_hid = keras.layers.Dense(self.config.user_embedding_dim)(d_input)
+            score = keras.layers.dot([u_hid, d_hid], -1)
+        else:
+            raise NotImplementedError
+        return keras.Model([u_input, d_input], score)
+
+    def _build_model(self):
+        idx = keras.Input((1,))
+        idx_mask = keras.Input((1,))
+        ch_title = keras.Input(self.training_data['ch_title'].shape[1:])
+        ch_vert = keras.Input(self.training_data['ch_vert'].shape[1:])
+        ch_subvert = keras.Input(self.training_data['ch_subvert'].shape[1:])
+        cd_title = keras.Input(self.training_data['cd_title'].shape[1:])
+        cd_vert = keras.Input(self.training_data['cd_vert'].shape[1:])
+        cd_subvert = keras.Input(self.training_data['cd_subvert'].shape[1:])
+        cd_title_one = keras.Input(self.training_data['cd_title'].shape[2:])
+        cd_vert_one = keras.Input((1,))
+        cd_subvert_one = keras.Input((1,))
+
+        cd_titles = models.Split5()(cd_title)
+        cd_verts = models.Split5()(keras.layers.Lambda(keras.backend.expand_dims)(cd_vert))
+        cd_subverts = models.Split5()(keras.layers.Lambda(keras.backend.expand_dims)(cd_subvert))
+
+        ch_title_encoder, ch_vert_encoder, ch_subvert_encoder, doc_encoder, self.title_encoder = self.get_doc_encoder()
+        user_encoder = self.get_user_encoder()
+
+        ch_mask = models.ComputeMasking()(ch_title)
+        ch_title_vec = ch_title_encoder(ch_title)
+        ch_vert_vec = ch_vert_encoder(keras.layers.Reshape((self.training_data['ch_vert'].shape[-1], 1))(ch_vert))
+        ch_subvert_vec = ch_subvert_encoder(
+            keras.layers.Reshape((self.training_data['ch_subvert'].shape[-1], 1))(ch_subvert))
+
+        if self.config.use_vertical:
+            ch_vec = keras.layers.concatenate([ch_title_vec, ch_vert_vec, ch_subvert_vec])
+        else:
+            ch_vec = ch_title_vec
+        ch_vec = keras.layers.Lambda(lambda x: x[0] * keras.backend.expand_dims(x[1]))([ch_vec, ch_mask])
+        user_vec = user_encoder([idx, idx_mask, ch_vec])
+
+        cd_vecs = [doc_encoder([title, vert, subvert]) for title, vert, subvert in
+                   zip(cd_titles, cd_verts, cd_subverts)]
+        cd_vec_one = doc_encoder([cd_title_one, cd_vert_one, cd_subvert_one])
+
+        scorer = self.get_score_model(user_vec, cd_vec_one)
+
+        score = keras.layers.Activation('sigmoid')(scorer([user_vec, cd_vec_one]))
+        scores = [scorer([user_vec, cd_vec]) for cd_vec in cd_vecs]
+        logits = keras.layers.Activation('softmax')(keras.layers.concatenate(scores))
+
+        self.train_model = keras.Model(
+            [idx, idx_mask, ch_title, ch_vert, ch_subvert, cd_title, cd_vert, cd_subvert], logits)
+        self.train_model.compile(
+            optimizer=keras.optimizers.Adam(self.config.learning_rate),
+            loss=keras.losses.categorical_crossentropy,
+            metrics=[keras.metrics.categorical_accuracy])
+
+        self.test_model = keras.Model(
+            [idx, idx_mask, ch_title, ch_vert, ch_subvert, cd_title_one, cd_vert_one, cd_subvert_one], score)
+        self.test_model.compile(
+            optimizer=keras.optimizers.SGD(),
+            loss=keras.losses.binary_crossentropy,
+            metrics=[utils.auc_roc])
+
+        self.train_model.summary()
+        self.test_model.summary()
+
+    def callback(self, epoch):
+        metric_vars = [i for i in tf.local_variables() if 'auc_roc' in i.name.split('/')[1]]
+        keras.backend.get_session().run(tf.initializers.variables(metric_vars))
+        if epoch in self.config.lrd_on_epochs:
+            keras.backend.set_value(
+                self.train_model.optimizer.lr,
+                keras.backend.get_value(self.train_model.optimizer.lr) * self.config.learning_rate_decay)
+
+
+class CookAlt(Cook):
+    def __init__(self, config: settings.Config):
+        super(CookAlt, self).__init__(config)
+        logging.info('[+] loading vertical data')
+        self.vert_data = dict(np.load(self.config.vert_npz_input))
+        logging.info('[-] loaded vertical data')
+        self.config.epochs *= self.config.round
+        self.train_vert = True
+        self.vert_train = sorted(np.random.choice(len(self.vert_data['title']),
+                                                  round(len(self.vert_data['title']) * 0.9)))
+        s = set(self.vert_train)
+        self.vert_valid = [x for x in range(len(self.vert_data['title'])) if x not in s]
+
+    def train(self):
+        if self.train_vert:
+            return self.vert_data['title'][self.vert_train], [self.vert_data['vert'][self.vert_train],
+                                                              self.vert_data['subvert'][self.vert_train]]
+        else:
+            return super(CookAlt, self).train()
+
+    def valid(self):
+        if self.train_vert:
+            return self.vert_data['title'][self.vert_valid], [self.vert_data['vert'][self.vert_valid],
+                                                              self.vert_data['subvert'][self.vert_valid]]
+        else:
+            return super(CookAlt, self).valid()
+
+    def build_model(self, epoch):
+        if epoch == 0:
+            self._build_model()
+        if epoch % self.config.round == 0:
+            self._train_model = self.train_model
+            self._test_model = self.test_model
+            self.train_model = self.test_model = self.vert_model
+            self.train_vert = True
+        elif epoch % self.config.round == self.config.round - 1:
+            self.train_model = self._train_model
+            self.test_model = self._test_model
+            self.train_vert = False
+        return self.train_model
+
+    def _build_model(self):
+        super(CookAlt, self)._build_model()
+        vert_title = keras.Input(self.vert_data['title'].shape[1:])
+        vert_vec = self.title_encoder(vert_title)
+        vert_logits = keras.layers.Dense(self.vert_data['vert'].shape[-1], activation='softmax', name='vert')(vert_vec)
+        subvert_logits = keras.layers.Dense(self.vert_data['subvert'].shape[-1], activation='softmax', name='subvert')(
+            vert_vec)
+        self.vert_model = keras.Model(vert_title, [vert_logits, subvert_logits])
+        self.vert_model.compile(
+            optimizer=keras.optimizers.Adam(self.config.learning_rate),
+            loss=keras.losses.categorical_crossentropy,
+            metrics=[keras.metrics.categorical_accuracy])
+        self.vert_model.summary()
+        self._train_model = self.train_model
+        self._test_model = self.test_model
+
+    def callback(self, epoch):
+        metric_vars = [i for i in tf.local_variables() if 'auc_roc' in i.name.split('/')[1]]
+        keras.backend.get_session().run(tf.initializers.variables(metric_vars))
+        if epoch // self.config.round in self.config.lrd_on_epochs and \
+                epoch % self.config.round == self.config.round - 1:
+            keras.backend.set_value(
+                self.train_model.optimizer.lr,
+                keras.backend.get_value(self.train_model.optimizer.lr) * self.config.learning_rate_decay)
+            keras.backend.set_value(
+                self._train_model.optimizer.lr,
+                keras.backend.get_value(self._train_model.optimizer.lr) * self.config.learning_rate_decay)
+
+
+class CookFT:
+    def __init__(self, config: settings.Config):
+        self.config = config
+        config.use_generator = True
+        logging.info('[+] loading training data')
+        self.training_data = utils.load_sparse_matrix(self.config.train_sparse_input)
+        logging.info('[-] loaded training data')
+        logging.info('[+] loading testing data')
+        self.test_data = utils.load_sparse_matrix(self.config.test_sparse_input)
+        logging.info('[-] loaded testing data')
+        self.training_step = len(self.training_data['y']) // self.config.batch_size
+        self.validation_step = self.config.validation_step // self.config.batch_size
+        if self.config.days == 7:
+            self.config.user_feature_size = 39627
+            self.config.doc_feature_size = 20484
+        else:
+            self.config.user_feature_size = 40040
+            self.config.doc_feature_size = 20521
+
+    def train(self):
+        while True:
+            i = 0
+            for i in range(self.config.batch_size, len(self.training_data['y']), self.config.batch_size):
+                yield self.training_data['matrix'][i - self.config.batch_size:i].toarray(), \
+                      self.training_data['y'][i - self.config.batch_size:i]
+            if i < len(self.training_data['y']):
+                yield self.training_data['matrix'][i:].toarray(), \
+                      self.training_data['y'][i:]
+
+    def valid(self):
+        while True:
+            i = 0
+            for i in range(self.config.batch_size, len(self.test_data['y']), self.config.batch_size):
+                yield self.test_data['matrix'][i - self.config.batch_size:i].toarray(), \
+                      self.test_data['y'][i - self.config.batch_size:i]
+            if i < len(self.test_data['y']):
+                yield self.test_data['matrix'][i:].toarray(), \
+                      self.test_data['y'][i:]
+
+    def test(self):
+        i = 0
+        z = set(int(round(len(self.test_data['y']) * t)) for t in np.arange(0.1, 1.0, 0.1))
+        for i in range(self.config.batch_size, len(self.test_data['y']), self.config.batch_size):
+            if i in z:
+                print(i, np.round(i / len(self.test_data['y']), 2))
+            yield self.test_data['matrix'][i - self.config.batch_size:i].toarray(), \
+                  [self.test_data['user'][i - self.config.batch_size:i],
+                   self.test_data['impr'][i - self.config.batch_size:i],
+                   np.round(np.random.rand(self.config.batch_size)),
+                   self.test_data['y'][i - self.config.batch_size:i]]
+        if i < len(self.test_data['y']):
+            yield self.test_data['matrix'][i:].toarray(), \
+                  [self.test_data['user'][i:],
+                   self.test_data['impr'][i:],
+                   np.round(np.random.rand(self.config.batch_size)),
+                   self.test_data['y'][i:]]
+
+    def build_model(self, epoch):
+        if epoch == 0:
+            self._build_model()
+        return self.train_model
+
+    def _build_model(self):
+        features_i = keras.Input((self.config.user_feature_size + self.config.doc_feature_size,))
+        features_u = keras.layers.Lambda(lambda x: x[:, :self.config.user_feature_size])(features_i)
+        features_d = keras.layers.Lambda(lambda x: x[:, -self.config.doc_feature_size:])(features_i)
+        if self.config.arch == 'dssm':
+            fu = keras.Sequential([
+                keras.layers.Dense(300, activation='tanh'),
+                keras.layers.Dense(300, activation='tanh'),
+                keras.layers.Dense(128, ),
+            ])(features_u)
+            fd = keras.layers.Dense(128, )(features_d)
+            logits = keras.layers.Activation('sigmoid')(keras.layers.dot([fu, fd], axes=-1))
+        elif self.config.arch == 'deepfm':
+            f1 = keras.layers.Dense(1)(features_i, activation='relu')(features_i),
+            fd = keras.Sequential([
+                keras.layers.Dropout(0.5),
+                keras.layers.Dense(128, activation='relu'),
+                keras.layers.Dropout(0.5),
+                keras.layers.Dense(64, activation='relu'),
+                keras.layers.Dropout(0.5),
+                keras.layers.Dense(32, activation='relu'),
+                keras.layers.Dropout(0.5),
+                keras.layers.Dense(1, activation='relu'),
+            ])(features_i)
+            f3 = keras.layers.concatenate([f1, fd])
+            logits = keras.layers.Dense(1, activation='sigmoid')(f3)
+        elif self.config.arch == 'wnd':
+            f1 = keras.layers.Dense(200, activation='relu')(features_i)
+            f2 = keras.layers.Dense(100, activation='relu')(f1)
+            f3 = keras.layers.concatenate([f2, features_i])
+            logits = keras.layers.Dense(1, activation='sigmoid')(f3)
+        else:
+            raise NotImplementedError()
+        self.test_model = self.train_model = keras.Model(features_i, logits)
+        self.train_model.compile('adam', 'binary_crossentropy', ['acc'])
+
+
+class CookCNN(Cook):
+    def get_doc_encoder(self):
+        title = keras.Input(self.training_data['ch_title'].shape[2:])
+        # vert = keras.Input(self.training_data['ch_vert'].shape[2:])
+        # subvert = keras.Input(self.training_data['ch_subvert'].shape[2:])
+        vert = keras.Input((1,))
+        subvert = keras.Input((1,))
+
+        title_embedding = np.load(self.config.title_embedding_input + '.npy')
+        title_embedding_layer = keras.layers.Embedding(
+            *title_embedding.shape,
+            input_length=self.training_data['ch_title'].shape[-1],
+            weights=[title_embedding],
+            trainable=self.config.textual_embedding_trainable)
+        title_e = title_embedding_layer(title)
+        title_d = keras.layers.Dropout(self.config.dropout)(title_e)
+        title_c = keras.layers.Conv1D(*self.config.title_filter_shape, padding='same', activation='relu', strides=1)(
+            title_d)
+        title_m = keras.layers.Lambda(
+            lambda x: x[0] * keras.backend.expand_dims(
+                keras.backend.switch(
+                    keras.backend.equal(x[1], 0),
+                    keras.backend.zeros_like(x[1], dtype=keras.backend.floatx()),
+                    keras.backend.ones_like(x[1], dtype=keras.backend.floatx()))))([title_c, title])
+
+        title_m = keras.layers.Masking()(title_m)
+        title_a = models.SimpleAttentionMaskSupport()(keras.layers.Dropout(self.config.dropout)(title_m))
+
+        vert_embedding_layer = keras.layers.Embedding(len(utils.verticals), self.config.vertical_embedding_dim)
+        subvert_embedding_layer = keras.layers.Embedding(len(utils.subverticals), self.config.subvertical_embedding_dim)
+
+        vert_m = keras.layers.Reshape((self.config.vertical_embedding_dim,))(vert_embedding_layer(vert))
+        subvert_m = keras.layers.Reshape((self.config.subvertical_embedding_dim,))(subvert_embedding_layer(subvert))
+
+        if self.config.use_vertical:
+            dense = keras.layers.concatenate([title_a, vert_m, subvert_m])
+        else:
+            dense = title_a
+
+        return (keras.layers.TimeDistributed(keras.Model(title, title_a)),
+                keras.layers.TimeDistributed(keras.Model(vert, vert_m)),
+                keras.layers.TimeDistributed(keras.Model(subvert, subvert_m)),
+                keras.Model([title, vert, subvert], dense),
+                keras.Model(title, title_a))
+
+    def _build_model(self):
+        idx = keras.Input((1,))
+        idx_mask = keras.Input((1,))
+        ch_title = keras.Input(self.training_data['ch_title'].shape[1:])
+        ch_vert = keras.Input(self.training_data['ch_vert'].shape[1:])
+        ch_subvert = keras.Input(self.training_data['ch_subvert'].shape[1:])
+        cd_title = keras.Input(self.training_data['cd_title'].shape[1:])
+        cd_vert = keras.Input(self.training_data['cd_vert'].shape[1:])
+        cd_subvert = keras.Input(self.training_data['cd_subvert'].shape[1:])
+        cd_title_one = keras.Input(self.training_data['cd_title'].shape[2:])
+        cd_vert_one = keras.Input((1,))
+        cd_subvert_one = keras.Input((1,))
+
+        cd_titles = models.Split5()(cd_title)
+        cd_verts = models.Split5()(keras.layers.Lambda(keras.backend.expand_dims)(cd_vert))
+        cd_subverts = models.Split5()(keras.layers.Lambda(keras.backend.expand_dims)(cd_subvert))
+
+        ch_title_encoder, ch_vert_encoder, ch_subvert_encoder, doc_encoder, self.title_encoder = self.get_doc_encoder()
+        user_encoder = self.get_user_encoder()
+
+        ch_mask = models.ComputeMasking()(ch_title)
+        ch_title_vec = ch_title_encoder(ch_title)
+        ch_vert_vec = ch_vert_encoder(keras.layers.Reshape((self.training_data['ch_vert'].shape[-1], 1))(ch_vert))
+        ch_subvert_vec = ch_subvert_encoder(
+            keras.layers.Reshape((self.training_data['ch_subvert'].shape[-1], 1))(ch_subvert))
+
+        if self.config.use_vertical:
+            ch_vec = keras.layers.concatenate([ch_title_vec, ch_vert_vec, ch_subvert_vec])
+        else:
+            ch_vec = ch_title_vec
+        ch_vec = keras.layers.Lambda(lambda x: x[0] * keras.backend.expand_dims(x[1]))([ch_vec, ch_mask])
+        user_vec = user_encoder([idx, idx_mask, ch_vec])
+
+        cd_vecs = [doc_encoder([title, vert, subvert]) for title, vert, subvert in
+                   zip(cd_titles, cd_verts, cd_subverts)]
+        cd_vec_one = doc_encoder([cd_title_one, cd_vert_one, cd_subvert_one])
+
+        scorer = self.get_score_model(user_vec, cd_vec_one)
+
+        score = keras.layers.Activation('sigmoid')(scorer([user_vec, cd_vec_one]))
+        scores = [scorer([user_vec, cd_vec]) for cd_vec in cd_vecs]
+        logits = keras.layers.Activation('softmax')(keras.layers.concatenate(scores))
+
+        self.train_model = keras.Model(
+            [idx, idx_mask, ch_title, ch_vert, ch_subvert, cd_title, cd_vert, cd_subvert], logits)
+        self.train_model.compile(
+            optimizer=keras.optimizers.Adam(self.config.learning_rate),
+            loss=keras.losses.categorical_crossentropy,
+            metrics=[keras.metrics.categorical_accuracy])
+
+        self.test_model = keras.Model(
+            [idx, idx_mask, ch_title, ch_vert, ch_subvert, cd_title_one, cd_vert_one, cd_subvert_one], score)
+        self.test_model.compile(
+            optimizer=keras.optimizers.SGD(),
+            loss=keras.losses.binary_crossentropy,
+            metrics=[utils.auc_roc])
+
+        self.train_model.summary()
+        self.test_model.summary()
